@@ -1,0 +1,16 @@
+!table
+!version 450
+!charset WindowsLatin1
+
+Definition Table
+  Type NATIVE Charset "WindowsLatin1"
+  Fields 4
+    UNIQUE_ID Float ;
+    NAME Char (70) Index 1 ;
+    PROV Char (2) ;
+    ModelAreaName Char (70) ;
+begin_metadata
+"\IsReadOnly" = "FALSE"
+"\MapInfo" = ""
+"\MapInfo\TableID" = "f29d06f0-f4bc-48b3-9d1d-6935f42a0658"
+end_metadata

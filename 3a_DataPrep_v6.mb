@@ -1,0 +1,589 @@
+' V3 - changes Postal code prep so that a single postal code file is created not separate ones for Urnban and Rural 
+' Last Modified: 
+' Processing Time: 
+' Status: 
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Include "MapBasic.def"
+Declare Sub Prep_Muni
+Declare Sub DupMuniFix	
+Declare Sub Prep_Roads
+Declare Sub Prep_PostalPoints
+Declare Sub Prep_PopData1
+Declare Sub Prep_PopData2
+Declare Sub Prep_PPN
+Declare Sub AppendProv
+Declare Sub Prep_GNWpoints
+
+Declare Sub UpdateLog
+Declare Sub UpdateLogLastLine
+Declare Sub GracefulExit
+
+Declare Sub TimeCheck
+
+	Global FP_Master, FP_Input, FP_xStore, FP_Wrking, FP_WrkingDOS, FP_Support, FP_PPNsupport as String
+	Global i, z, counter as Integer
+	Global ProvAbb() as String
+	Global Startime, TimeCheckType, LastCheckTime, CheckTime as Integer
+	Global Date, Time, ProcMsg, ProvMsg, Msg1, Msg2, Msg3, Msg4, Msg5, Msg6 as String
+	Global MsgNumber as Integer
+	Global ErrMsg as String
+	Global AreaName as String
+	Dim ColNum1, ColNum2, GroupNum as String
+	Dim BadFSAcnt, RowCount, RowCount1 as Integer
+	Dim FileState, TrgtFileExt as String
+
+' Print "End Program" Beep End Program
+
+Sub Prep_PopData1			'Appends the Province abbreviation to the entire data set
+	Dim ColNum1, ColNum2 as String
+
+	OnError Goto ErrorRecovery
+		Print "Data Prep - Population Data 1 - Append province"
+
+		ProcMsg = "Data Preparation"	ProvMsg = ""	Msg1 = "Appending province to PopData "	Msg2 = "" 	Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = "" 	Call UpdateLog
+
+		Open table ApplicationDirectory$() + "ConfigurationFile.TAB" as ConfigFile Interactive 
+		Select * from ConfigFile where ID="POP" into TT1
+		FileState = TT1.FileStatus	
+		TrgtFileExt = TT1.FileName
+
+			If FileState = "New" Then
+				Msg2 = "Detected new file: Processing will continue"  	MsgNumber = 2		Call UpdateLogLastLine
+
+				Open table FP_xStore + TrgtFileExt as PopData
+				ColNum1 = "Col" + ColumnInfo ("PopData", "POSTCODE", COL_INFO_NUM)		'Determines the column number of postal code fieldPrint ColNum1
+
+				Open Table FP_xStore + "EnhancedPostalPoint.TAB" as PostalPoints
+				ColNum2 = "Col" + ColumnInfo ("PostalPoints", "POSTALCODE", COL_INFO_NUM)		'finds column number for postal code field
+
+				Alter Table "PopData" ( add PROV Char(2) )
+				Create Index On PopData (POSTCODE)
+				Add Column "PopData" (PROV )From PostalPoints Set To PROV Where ColNum1 = ColNum2
+				Commit Table PopData
+
+				Msg3 = "Provincial PopData files saved"  	MsgNumber = 3		Call UpdateLogLastLine
+			Else
+				Msg2 = "Detected old file: Moving to next operation"  	MsgNumber = 2		Call UpdateLogLastLine
+			End If
+		Close All
+	Exit Sub
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+
+
+Sub Prep_Muni		'Creates LUT of municipalities and model areas, used for dividing roads into model areas 
+	OnError Goto ErrorRecovery
+
+		Print "Data Prep - Municipalities"
+		ProcMsg = "Data Preparation"	ProvMsg = ProvAbb(i)	Msg1 = "Municiplaities"	Msg2 = "" 	Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = ""	Call UpdateLog
+
+		Open table ApplicationDirectory$() + "ConfigurationFile.TAB" as ConfigFile 
+		Select * from ConfigFile where ID="MUN" into TT1
+		FileState = TT1.FileStatus	
+		TrgtFileExt = TT1.FileName						'File name and the extension
+
+
+
+		If FileState = "New" Then
+			Msg2 = "Detected new file - Creating Munis/Model Area lookup table"  	MsgNumber = 2		Call UpdateLogLastLine
+
+			Open table FP_xStore + TrgtFileExt as Muni
+				Select UNIQUE_ID, NAME, PROV from Muni where PROV= ProvAbb(i) order by NAME into TT1
+				Commit Table TT1 as FP_Wrking +  ProvAbb(i) + "\ModelAreaLUT.TAB"
+				Close Table Muni
+
+					'Compensates for wierd geometry which results in urban boundaries not getting a name
+					If ProvAbb(i)="BC" Then
+						Open Table FP_Wrking +  ProvAbb(i) + "\ModelAreaLUT.TAB"
+						Export "ModelAreaLUT" Into FP_Wrking +  ProvAbb(i) + "\TempFile.mif" Type "MIF" Overwrite
+						Close Table ModelAreaLUT
+						Import FP_Wrking +  ProvAbb(i) + "\TempFile.mif" Type "MIF" Into FP_Wrking +  ProvAbb(i) + "\ModelAreaLUT.TAB" Overwrite
+
+						Select * from ModelAreaLUT where NAME="GREATER VANCOUVER" into Selection 		'Splits region so it can be part of another model area
+						Set Target ON
+						Open Table FP_Support + "UBC_TrimArea.TAB"			
+						Select * from UBC_TrimArea where rowid =1 into Selection
+						Objects Split Into Target Data UNIQUE_ID=UNIQUE_ID, Name=Name, PROV=PROV
+
+						Select * from ModelAreaLUT where NAME="GREATER VANCOUVER" into Selection		'Removes portion of region that is enitrely in water, goal is to change centroid postion
+						Set Target ON
+						Select * from UBC_TrimArea where rowid =2 into Selection
+						Objects Erase Into Target Data UNIQUE_ID=UNIQUE_ID,NAME=NAME,PROV=PROV
+
+						Set Target OFF
+						Commit Table ModelAreaLUT
+					End IF
+
+		'Compensating for complex polygons located in more than one Model Area
+			Open Table FP_Support + "ModelAreas_" +ProvAbb(i)+ ".TAB" as ModelAreas		'Needed in following processes
+			Open Table FP_Wrking + ProvAbb(i) + "\ModelAreaLUT.TAB"
+				Alter Table "ModelAreaLUT" (add ModelAreaName Char(70),  Obj_Npolygons Integer)
+				Update ModelAreaLUT Set Obj_Npolygons = ObjectInfo(obj,21)
+				Commit Table ModelAreaLUT
+
+
+			Select * from ModelAreaLUT where Obj_Npolygons>1 into TT1		'Selects Munis made up of with >1 regions
+			RowCount1 = TableInfo (TT1, 8)
+				If RowCount1 > 1 Then
+					Commit Table TT1 as FP_Wrking + ProvAbb(i) + "\MultiObjPolys.TAB"
+					Delete from TT1
+					Commit Table ModelAreaLUT
+
+					Open Table FP_Wrking + ProvAbb(i) + "\MultiObjPolys.TAB"		'Disaggregates regions
+					Select * from MultiObjPolys
+					Objects Disaggregate Into Table MultiObjPolys Data UNIQUE_ID=UNIQUE_ID,NAME=NAME,PROV=PROV,ModelAreaName=ModelAreaName, Obj_Npolygons=Obj_Npolygons
+					Commit Table MultiObjPolys
+					Pack Table MultiObjPolys Graphic Data
+
+					Add Column "MultiObjPolys" (ModelAreaName )From ModelAreas Set To ModelAreaName Where contains		'Determines correct model area name
+					Commit Table MultiObjPolys
+
+
+			'Preparing and Executing the "Combine Using Column" function		'
+				Insert Into ModelAreaLUT ( COL1, COL2, COL3, COL4, COL5) Select COL1, COL2, COL3, COL4, COL5 From MultiObjPolys
+				Commit Table ModelAreaLUT
+				Pack Table ModelAreaLUT Graphic Data
+				Alter Table "ModelAreaLUT" ( drop Obj_Npolygons ) 
+				End If
+		
+				Add Column "ModelAreaLUT" (ModelAreaName )From ModelAreas Set To ModelAreaName Where contains
+				Commit Table ModelAreaLUT
+
+			Else
+				Msg2 = "Detected old file: Moving to next operation"  	MsgNumber = 2		Call UpdateLogLastLine
+			End If
+		Close All
+		
+	Exit Sub
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+'	Beep Print "Ending Program" TimeCheckType=0	Call TimeCheck Beep End Program
+
+Sub Prep_Roads
+	OnError Goto ErrorRecovery
+		Print "Data Prep - Roads"
+		ProcMsg = "Data Preparation"	ProvMsg = ProvAbb(i)	Msg1 = "Roads"	Msg2 = "" Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = "" 	Call UpdateLog
+
+		Open table ApplicationDirectory$() + "ConfigurationFile.TAB" as ConfigFile Interactive 
+		Select * from ConfigFile where ID="RDS" into TT1
+			FileState = TT1.FileStatus	
+			TrgtFileExt = TT1.FileName
+
+			Open table FP_xStore + TrgtFileExt as Roads
+				Print "  Selecting Roads"
+				Select UID, STREET, CARTO, LEFT_MAF, LEFT_PRV from Roads where LEFT_PRV= ProvAbb(i)and CARTO<=5 and SUFTYPE<>"Ramp" into TT1
+				Commit Table TT1 as FP_Wrking + ProvAbb(i) + "\Roads_Carto1to5" + ".TAB"
+					CoordSys Earth Projection 3, 62, "m", -96, 23, 20, 60, 0, 0 Bounds (-89717066.7319, -80920710.9208) (89717066.7319, 98513422.543) 'Lambert Conformal Conic, uses meters, better for P2P and Aggregation
+			Close Table Roads
+
+			Open Table FP_Wrking + ProvAbb(i) + "\Roads_Carto1to5.TAB" as ProvRoads
+				Alter Table "ProvRoads" ( add Xcoord Float, Ycoord Float, RoadCount Float, ModelAreaName Char(70) )
+				Create Index On ProvRoads (LEFT_MAF)
+				ColNum1 = "Col" + ColumnInfo ("ProvRoads", "LEFT_MAF", COL_INFO_NUM)
+
+			Open Table FP_Wrking + ProvAbb(i) + "\ModelAreaLUT.TAB" as ModelAreaLUT
+				ColNum2 = "Col" + ColumnInfo ("ModelAreaLUT", "Name", COL_INFO_NUM)
+
+		Call DupMuniFix	'Checks for duplicat municipalities names in province. Modifies muni name in boundary and road files where needed
+
+			Select * from ProvRoads where ModelAreaName="" into TT2
+			Add Column "TT2" (ModelAreaName ) From ModelAreaLUT Set To ModelAreaName Where ColNum1 = ColNum2
+			Commit Table ProvRoads
+
+
+			Open Table FP_Support +  "\ModelAreas_" + ProvAbb(i)+ ".TAB" as ModelAreaTable
+			Print "  Dividing roads by model area"
+				Fetch First from ModelAreaTable
+				Do while not EOT (ModelAreaTable)
+					AreaName = ModelAreaTable.ModelAreaName	
+					Print "     " + AreaName
+
+					Select * from ProvRoads where ModelAreaName=AreaName into TT1
+
+					Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\Roads_Carto1to5.TAB"
+
+					Open Table FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\Roads_Carto1to5.TAB" as AreaRoads
+						Select * from AreaRoads where CARTO>=2 into TT1
+							Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\Roads_Carto2to5.TAB"
+						Select * from AreaRoads where CARTO<=2 into TT5
+							Commit Table TT5 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\Roads_Carto1to2.TAB"
+					Close Table AreaRoads
+
+					Open Table FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\Roads_Carto2to5.TAB" as AreaRoads
+						Select * from AreaRoads where ObjectLen(obj, "km")<=1 into TT1
+							Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\ShortRoads.TAB"
+							Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\ShortRoadPts.TAB"
+							Run Menu command 311
+							Commit Table Selection as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\LongRoads.TAB"
+					Close Table AreaRoads
+
+					Open Table FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\ShortRoadPts.TAB" as ShortRoadPts
+						Set Coordsys Table ShortRoadPts
+						Update ShortRoadPts Set Xcoord = CentroidX(obj)
+						Update ShortRoadPts Set Ycoord = CentroidY(obj)
+						Commit Table ShortRoadPts
+						Drop Map ShortRoadPts
+
+						Create Map For ShortRoadPts CoordSys Earth Projection 3, 62, "m", -96, 23, 20, 60, 0, 0 Bounds (-89717066.7319, -80920710.9208) (89717066.7319, 98513422.543)
+						Set Style Symbol MakeSymbol (34, Yellow, 5)
+						Update ShortRoadPts Set obj = CreatePoint(Xcoord, Ycoord)
+						Update ShortRoadPts Set RoadCount=1
+						Commit Table ShortRoadPts
+					Close Table ShortRoadPts
+				Fetch Next from ModelAreaTable
+				Loop
+
+			Msg3 = "Provincial road files saved"  	MsgNumber = 3		Call UpdateLogLastLine
+		Close All
+
+	Exit Sub
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+
+' Beep Print "Ending Program" TimeCheckType=0	Call TimeCheck Beep End Program
+
+
+
+Sub Prep_PopData2			'Pop data is not divided into model areas, it is appended to postal codes which is divided
+	OnError Goto ErrorRecovery
+		Print "Data Prep - Population Data  2 - Divide by province"
+		ProcMsg = "Data Preparation"	ProvMsg = ProvAbb(i)	Msg1 = "Pop Data"	Msg2 = "Dividing by province" Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = "" 	Call UpdateLog
+
+
+		Open table ApplicationDirectory$() + "ConfigurationFile.TAB" as ConfigFile Interactive 
+		Select * from ConfigFile where ID="POP" into TT1
+		TrgtFileExt = TT1.FileName
+
+			Open table FP_xStore + TrgtFileExt as PopData
+				Select * from PopData where Prov = ProvAbb(i) into TT1
+				Commit Table TT1 as FP_Wrking + ProvAbb(i) + "\PopTotal" + ".TAB"
+			Close All
+			Msg3 = "Complete"  	MsgNumber = 3		Call UpdateLogLastLine
+
+	Exit Sub
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+
+
+Sub Prep_PostalPoints
+	Dim ColNum1, ColNum2 as String
+	Dim RowCount1, RowCount2 as Integer
+
+	OnError Goto ErrorRecovery
+
+		Print "" Print "Data Prep - Postal Points"	
+		ProcMsg = "Data Preparation"	ProvMsg = ProvAbb(i)	Msg1 = "Postal Points"	Msg2 = "" 	Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = "" Call UpdateLog
+
+		Open table ApplicationDirectory$() + "ConfigurationFile.TAB" as ConfigFile Interactive 
+		Select * from ConfigFile where ID="EPC" into TT1
+		FileState = TT1.FileStatus	
+		TrgtFileExt = TT1.FileName
+
+		If FileState = "New" Then
+			Msg2 = "Detected new file: Processing will continue"  	MsgNumber = 2		Call UpdateLogLastLine
+
+			Open Table FP_xStore + TrgtFileExt as PostalPoints
+					Select POSTALCODE, MEP_ID, SLI, PROV, COMM_NAME, MUNICIPAL, LONGITUDE, LATITUDE from PostalPoints where SLI=1 and PROV=ProvAbb(i) into TT1
+					Commit Table TT1 as FP_Wrking +  ProvAbb(i) +  "\PostalPointsAll.TAB"
+					Close Table PostalPoints
+			Open Table FP_Wrking +  ProvAbb(i) +  "\PostalPointsAll.TAB"
+				ColNum1 = "Col" + ColumnInfo ("PostalPointsAll", "POSTALCODE", COL_INFO_NUM)
+			Open Table FP_Wrking +  ProvAbb(i) +  "\PopTotal.TAB" as PopData
+				ColNum2 = "Col" + ColumnInfo ("PopData", "POSTCODE", COL_INFO_NUM)
+
+			Alter Table "PostalPointsAll" ( add PopTot Float )
+			Add Column "PostalPointsAll" (PopTot )From PopData Set To PP_TOT Where ColNum1 = ColNum2
+			Commit Table PostalPointsAll
+
+			Open Table FP_Support +  "\ModelAreas_" + ProvAbb(i) + ".TAB" as ModelAreaTable
+				Fetch First from ModelAreaTable
+				Do while not EOT (ModelAreaTable)
+					AreaName = ModelAreaTable.ModelAreaName
+					Print "     " + AreaName
+
+					Select * from PostalPointsAll, ModelAreaTable where PostalPointsAll.Obj Within ModelAreaTable.Obj And ModelAreaTable.ModelAreaName= AreaName into TT1
+						Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\PostalPoints.TAB"
+
+				Fetch Next from ModelAreaTable
+				Loop
+
+
+			Msg3 = " Postal Point table saved"  	MsgNumber = 3		Call UpdateLogLastLine
+		Else
+			Msg3 = "Detected old file: Moving to next operation"  	MsgNumber = 3		Call UpdateLogLastLine
+		End If
+		Close All
+
+
+	Exit Sub
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+
+Sub Prep_PPN		' Divides custom PPN and Voronoi layers into the model areas
+	OnError Goto ErrorRecovery
+
+	Print "Data Prep - Place Name Points"
+	ProcMsg = "Data Preparation"	ProvMsg = ProvAbb(i)	Msg1 = "PPN Points"	Msg2 = "Dividing by model area" 	Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = ""	Call UpdateLog
+
+		Open Table FP_PPNsupport + "PPN_" + ProvAbb(i)+ ".TAB" as PPN						' All three of these tables can be located in the same folder when model is done
+		Open Table FP_PPNsupport + "Voronoi_" + ProvAbb(i)+ ".TAB" as Voronoi
+		Open Table FP_Support +  "\ModelAreas_" + ProvAbb(i) + ".TAB" as ModelAreaTable
+
+			Fetch First from ModelAreaTable
+				Do while not EOT (ModelAreaTable)
+				AreaName = ModelAreaTable.ModelAreaName
+				Print "     " + AreaName
+
+				Select * from PPN, ModelAreaTable where PPN.Obj Within ModelAreaTable.Obj And ModelAreaTable.ModelAreaName= AreaName into TT1
+					Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\PlaceNamePoints.TAB"
+				Select Voronoi.PPname, Voronoi.Pop2 from Voronoi, ModelAreaTable where Voronoi.Obj Intersects ModelAreaTable.Obj and ModelAreaTable.ModelAreaName = AreaName into TT1
+					Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\Voronoi.TAB"
+			Fetch Next from ModelAreaTable
+			Loop
+
+		Close All
+	Exit Sub
+
+
+
+
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+
+'***Double check that this procedure is used - remove if not!
+Sub AppendProv			'Appends the province abbreviation to the manifold data
+	Dim ColNum1, ColNum2 as String
+	
+			ColNum1 = "Col" + ColumnInfo ("PopData", "POSTCODE", COL_INFO_NUM)		'Determines the column number of postal code fieldPrint ColNum1
+
+			Open Table FP_xStore + "EnhancedPostalPoint.TAB" as PostalPoints
+				ColNum2 = "Col" + ColumnInfo ("PostalPoints", "POSTALCODE", COL_INFO_NUM)		'finds column number for postal code field
+
+			Alter Table "PopData" ( add PROV Char(2) )
+			Create Index On PopData (POSTCODE)
+			Add Column "PopData" (PROV )From PostalPoints Set To PROV Where ColNum1 = ColNum2
+			Commit Table PopData
+End Sub
+	
+
+Sub DupMuniFix	
+	OnError Goto ErrorRecovery
+
+	Dim RowCount1, LoopCounter as Integer
+	Dim vMuniName, cmdSelect, vAreaName  as String
+	Dim vMinX, vMinY, vMaxX, vMaxY as Float
+
+Dim cmdDupTarget, cmdMuniRoads, cmdMuniBoundry as String
+Dim Obj1MinY, Obj1MaxY, Obj2MinY, Obj2MaxY, DivCoord as Float
+Dim Obj1MinX, Obj1MaxX, Obj2MinX, Obj2MaxX as Float
+
+	Print " Checking and fixing Muni duplicates for " + ProvAbb(i)
+
+	'STEP 1: Creates a list of municipalities that appear more than once in the ModelAreaLUT
+	LoopCounter=0		'used in Step 2
+
+	Select NAME, Count(*) from ModelAreaLUT group by NAME order by Col2 desc into TT1
+		Select * from TT1 where COL2>1 into TT2 
+		RowCount1 = TableInfo (TT2, 8)
+			
+		If RowCount1 = 0 Then					
+			Print "  No duplicates"
+			Exit Sub
+
+		Else									'Duplicates are found, preparing to find out if any of them are problems
+			Print " Found duplicats. Checking for problems"
+			Msg3 = "Found " + RowCount1 + " duplicate municipality names, proceeding with fix"  	MsgNumber = 3		Call UpdateLogLastLine
+
+			Commit Table TT2 as FP_Wrking +  ProvAbb(i) + "\xDupMunis_LUT1.TAB"
+			Close Table TT1
+			Open Table FP_Wrking +  ProvAbb(i) + "\xDupMunis_LUT1.TAB" as DupsList
+
+			'Lookup table is created which will hold records with duplicate munis
+			Create Table 	"xDupMunis_Problems" (UNIQUE_ID Float, NAME Char(70), PROV Char(2), ModelAreaName Char(70)) 
+							File FP_Wrking +  ProvAbb(i) + "xDupMunis_Problems.TAB"
+							TYPE NATIVE Charset "WindowsLatin1"
+							Create Map For xDupMunis_Problems CoordSys Earth Projection 1, 104
+		End If 
+
+
+	'STEP 2: Checks each region where there is a duplicate municipality names and determines 
+			 'if each object is in the same model area or different ones. Previously the modelAreaLUT
+			 'has been disaggregated and the results updated with model area name
+
+			Fetch First from DupsList		'cycles through LUT looking for problems
+				Do while not EOT (DupsList)
+				vMuniName = DupsList.Name
+				'Print " " + vMuniName
+
+				cmdDupTarget = "Select * from ModelAreaLUT where NAME = " +Chr$(34)+ vMuniName +Chr$(34) + " into TT5"
+				Run Command cmdDupTarget
+				Commit Table TT5 as FP_Wrking +  ProvAbb(i) + "\TempTable.TAB"
+				Open Table FP_Wrking +  ProvAbb(i) + "\TempTable.TAB"
+
+				Select * from TempTable group by ModelAreaName into TT1		'Determines the number of different Model Area names
+				RowCount = TableInfo (TT1,8)
+					If RowCount = 1 Then
+						'Print " Blah"
+						Close Table TempTable
+					Else
+						Insert into xDupMunis_Problems Select * from TT5
+						Commit Table xDupMunis_Problems
+						Close Table TempTable
+					End If
+			Fetch Next from DupsList
+			Loop
+		Close Table TT5
+		Print " STEP 1 and 2 Complete"
+
+	'STEP 3: Checks if there are are problems, If yes then prepares for further processing
+		RowCount1 = TableInfo (xDupMunis_Problems, 8)
+		If RowCount1 = 0 Then
+			Print "  No duplicates"
+			Exit Sub
+		Else
+		'Sorts the xDupMunis_Problems table by the size of the region, saves to the same name
+			Select UNIQUE_ID, NAME, PROV, ModelAreaName, Area(obj, "sq km") "ObjArea" from xDupMunis_Problems order by ObjArea into TT1
+			Commit Table TT1 as FP_Wrking +  ProvAbb(i) + "\XYZ.TAB"
+			Close Table xDupMunis_Problems
+			Open Table FP_Wrking +  ProvAbb(i) + "\XYZ.TAB"
+			Commit Table XYZ as FP_Wrking +  ProvAbb(i) + "\xDupMunis_Problems.TAB"
+			Drop Table XYZ
+			Open Table FP_Wrking +  ProvAbb(i) + "\xDupMunis_Problems.TAB"
+
+		'Creates and updates fields with coordinates of MBR
+			Alter Table "xDupMunis_Problems" ( add MinX Float,MinY Float,MaxX Float,MaxY Float, DivMethod Char(10), CenterCoord Float )
+			Update xDupMunis_Problems Set MinX = ObjectGeography (obj, 1)
+			Update xDupMunis_Problems Set MinY = ObjectGeography (obj, 2)
+			Update xDupMunis_Problems Set MaxX = ObjectGeography (obj, 3)
+			Update xDupMunis_Problems Set MaxY = ObjectGeography (obj, 4)
+			Commit Table xDupMunis_Problems
+
+			Open Table FP_Wrking +  ProvAbb(i) + "\TempTable.TAB"		'Don't need this anymore
+			Drop Table TempTable
+			Print " STEP 3 Complete"
+		End If
+
+	'STEP 4: 
+		Fetch First from xDupMunis_Problems
+		Do while not EOT (xDupMunis_Problems)
+			vMuniName = xDupMunis_Problems.Name
+			vAreaName = xDupMunis_Problems.ModelAreaName
+			vMinX = xDupMunis_Problems.MinX
+			vMinY = xDupMunis_Problems.MinY
+			vMaxX = xDupMunis_Problems.MaxX
+			vMaxY = xDupMunis_Problems.MaxY
+
+		'	Print vMuniName
+		'	Print vAreaName
+		'	Print vMinX
+		'	Print vMinY
+		'	Print vMaxX
+		'	Print vMaxY
+		'	Print ""
+
+				cmdSelect = "Select * from ProvRoads where LEFT_MAF = " +Chr$(34)+ vMuniName +Chr$(34) + " into TT_RoadList"
+				Run Command cmdSelect
+
+				cmdSelect = "Select * from TT_RoadList where   CentroidX(obj)>= " + vMinX +
+															" And CentroidX(obj)<= " + vMaxX +
+															" And CentroidY(obj)>= " + vMinY +
+															" And CentroidY(obj)<= " + vMaxY + " into TT1"
+				Run Command cmdSelect
+
+			Update TT1 Set ModelAreaName = vAreaName
+			Commit Table ProvRoads
+		Fetch Next from xDupMunis_Problems
+		Loop
+		Print " STEP 4 Complete"
+
+	Exit Sub
+
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+'Beep Print "Ending Program" TimeCheckType=0	Call TimeCheck Beep End Program
+
+
+Sub Prep_GNWpoints
+	OnError Goto ErrorRecovery
+		Print "Data Prep - Genworth Points"
+		ProcMsg = "Data Preparation"	ProvMsg = ProvAbb(i)	Msg1 = "Genworth Points"	Msg2 = "" Msg3 = "" Msg4 = "" Msg5 = "" Msg6 = "" 	Call UpdateLog
+
+		Open table ApplicationDirectory$() + "ConfigurationFile.TAB" as ConfigFile Interactive 
+		Select * from ConfigFile where ID="GNW" into TT1
+		TrgtFileExt = TT1.FileName
+
+		Open table FP_xStore + TrgtFileExt as Points
+		Print "  Selecting GNW points"
+
+		Select * from Points where Prov= ProvAbb(i) into TT1
+			Commit Table TT1 as FP_Wrking + ProvAbb(i) + "\GNWpoints" + ".TAB"
+			Close Table Points
+			Open Table FP_Wrking + ProvAbb(i) + "\GNWpoints.TAB" as GNWpoints
+			Alter Table "GNWpoints" ( add  ModelAreaName Char(70) )
+			Create Index On GNWpoints (Prov)
+	
+		Open Table FP_Wrking + ProvAbb(i) + "\ModelAreaLUT.TAB" as ModelAreaLUT
+			Add Column "GNWpoints" (ModelAreaName )From ModelAreaLUT Set To ModelAreaName Where contains	'Updates field with Model Area name
+			Commit Table GNWpoints
+
+		'Dividing points into model areas
+		Open Table FP_Support +  "\ModelAreas_" + ProvAbb(i)+ ".TAB" as ModelAreaTable
+		Print "  Dividing GNW points by model areas"
+				Fetch First from ModelAreaTable
+				Do while not EOT (ModelAreaTable)
+					AreaName = ModelAreaTable.ModelAreaName
+					Select * from GNWpoints where ModelAreaName=AreaName into TT1
+					Commit Table TT1 as FP_Wrking + ProvAbb(i) +"\xAreas\"+ AreaName + "\GNWpoints.TAB"
+				Fetch Next from ModelAreaTable
+				Loop
+	Close All
+
+	Exit Sub
+	ErrorRecovery:
+		ErrMsg = Error$()
+		Resume Zippy
+		Zippy: 		Call GracefulExit
+End Sub
+
+'	Beep Print "Ending Program" TimeCheckType=0	Call TimeCheck End Program
+
+
+
+'used for testing ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'		Dim SkipCode as Integer
+'		Select * from ConfigFile where ID="TestRun" into TT1
+'		SkipCode = TT1.Var
+'		If skipCode = 1 then 
+'			Print "Skipping PopData1"
+'			Exit Sub 
+'		End If
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
